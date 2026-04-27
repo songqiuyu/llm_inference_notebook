@@ -41,7 +41,7 @@ struct ggml_context {
     struct ggml_object * objects_end;
 };
 ```
-ggml_context本质是一个线性内存池的管理器，这里面称为`arena allocatgor`，是一个控制头。
+ggml_context本质是一个线性内存池的管理器，这里面称为`arena allocator`，是一个控制头。
 
 `mem_size`：是表示内存池的总大小（多少个字节），表示的是`mem_buffer`这片大内存的总容量上限
 
@@ -58,26 +58,143 @@ ggml_context本质是一个线性内存池的管理器，这里面称为`arena a
 `objects_end`：链表尾节点
 
 
-### 理解整个ctx
+#### 理解整个ctx
 
-![alt text](image.png)
+![ctx](image.png)
 
 如果不进行alloc，那整个ctx保留的就是元数据，这种方式让实际数据的存储与后端剥离开，不会先分配到内存中
 
+### ggml_tensor
 
-### ggml_opt_dataset
+```c
+struct ggml_tensor {
+    enum ggml_type type;
 
-ggml_opt_dataset是最新版里面，用来初始化数据集的。
+    struct ggml_backend_buffer * buffer;
 
-这里面有一个context，
+    int64_t ne[GGML_MAX_DIMS]; // number of elements
+    size_t  nb[GGML_MAX_DIMS]; // stride in bytes:
+                                // nb[0] = ggml_type_size(type)
+                                // nb[1] = nb[0]   * (ne[0] / ggml_blck_size(type)) + padding
+                                // nb[i] = nb[i-1] * ne[i-1]
 
+    // compute data
+    enum ggml_op op;
 
+    // op params - allocated as int32_t for alignment
+    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
 
+    int32_t flags;
+
+    struct ggml_tensor * src[GGML_MAX_SRC];
+
+    // source tensor and offset for views
+    struct ggml_tensor * view_src;
+    size_t               view_offs;
+
+    void * data;
+
+    char name[GGML_MAX_NAME];
+
+    void * extra; // extra things e.g. for ggml-cuda.cu
+
+    char padding[8];
+};
+```
+
+`type`：指的是数据的元素类型，决定的是每个元素占用多少字节
+`buffer`：tensor指向的后端存储区
+`ne`：number of element，指的是形状（一般是列、行，第三维，第四维）
+`nb`：number of Bytes，每个维度存多少个字节，这个是方便stride的，方便求地址用
+`ggml_op`：就是算子类型
+`op_params`：运算参数
 
 
 
 
 ### ggml_backend_buffer
+
+这个就是把数据实际存储到了该后端上
+
+```c
+struct ggml_backend_buffer {
+    struct ggml_backend_buffer_i  iface;
+    ggml_backend_buffer_type_t    buft;
+    void * context;
+    size_t size;
+    enum ggml_backend_buffer_usage usage;
+};
+```
+
+`ggml_backend_buffer_i`：这里面保存的是虚函数表，是一组虚函数指针，去定义这块内存怎么读写，是为了适配不同后端（CPU/CUDA/Metal）填入不同的函数实现，上层的代码去统一调用
+
+`buft`：记录自己是哪种类型的buffer，用来查询对齐要求、名称等元信息
+
+`context`：后端私有数据
+
+`size`：这块buffer的总字节数
+
+`usage`：用途标记
+
+
+#### ggml_backend_buffer_i
+
+```c
+struct ggml_backend_buffer_i {
+    // 释放底层内存
+    void         (*free_buffer)  (ggml_backend_buffer_t buffer);
+    // 返回内存起始地址
+    void *       (*get_base)     (ggml_backend_buffer_t buffer);
+    // 将tensor注册到buffer
+    enum ggml_status (*init_tensor)(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor);
+    // 对tensor数据区清零
+    void         (*memset_tensor)(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
+    // 把CPU数据写入buffer
+    void         (*set_tensor)   (ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+    // 从buffer读取数据返回cpu
+    void         (*get_tensor)   (ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+    // (optional) 2d data copies
+    void         (*set_tensor_2d)(...);
+    void         (*get_tensor_2d)(...);
+    // (optional) tensor copy between backends
+    bool         (*cpy_tensor)   (ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    // 整块buffer清零
+    void         (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
+    // (optional) reset any internal state
+    void         (*reset)        (ggml_backend_buffer_t buffer);
+};
+```
+
+#### 进一步理解
+
+![alt text](image-1.png)
+
+### ggml_opt_dataset
+
+ggml_opt_dataset是最新版里面，用来初始化数据集的。
+
+```c
+struct ggml_opt_dataset {
+    struct ggml_context   * ctx    = nullptr;
+    ggml_backend_buffer_t   buf    = nullptr;
+    struct ggml_tensor    * data   = nullptr;
+    struct ggml_tensor    * labels = nullptr;
+
+    int64_t ndata       = -1;
+    int64_t ndata_shard = -1;
+    size_t  nbs_data    = -1;
+    size_t  nbs_labels  = -1;
+
+    std::vector<int64_t> permutation;
+};
+```
+
+`ggml_context`：内存池管理器
+`ggml_backend_buffer_t`：后端存储
+`ggml_tensor`：数据tensor
+`ggml_tensor`：标签tensor
+
+
 
 
 ### ggml_tensor
