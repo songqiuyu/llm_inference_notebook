@@ -1,3 +1,5 @@
+[TOC]
+
 # 源码解读
 
 ## 核心数据结构
@@ -165,6 +167,7 @@ struct ggml_backend_buffer_i {
 };
 ```
 
+
 #### 进一步理解
 
 ![alt text](image-1.png)
@@ -195,14 +198,70 @@ struct ggml_opt_dataset {
 `ggml_tensor`：标签tensor
 
 
+### mnist_model
+
+对于mnist的demo来讲，这是一个关键的模型结构体
+
+```c
+struct mnist_model {
+    std::string arch;   // "fc"或者"cnn"，决定是用哪套权重
+    ggml_backend_sched_t backend_sched; // 后端调度器
+    std::vector<ggml_backend_t> backends;   // 可用后端列表
+    const int nbatch_logical;   // 逻辑batch_size，逻辑上来讲就是我们希望一次用多少个样本
+    const int nbatch_physical;  // 物理batch_size，物理上就是实际硬件并行计算多少个样本
+
+    struct ggml_tensor * images     = nullptr;  // 每次输入的一批图像tensor指针
+    struct ggml_tensor * logits     = nullptr;  // 模型输出的得分指针
+
+    // 权重信息
+    struct ggml_tensor * fc1_weight = nullptr;  
+    struct ggml_tensor * fc1_bias   = nullptr;
+    struct ggml_tensor * fc2_weight = nullptr;
+    struct ggml_tensor * fc2_bias   = nullptr;
+
+    // 这个是如果使用cnn来推理，那就是这套指针
+    struct ggml_tensor * conv1_kernel = nullptr;
+    struct ggml_tensor * conv1_bias   = nullptr;
+    struct ggml_tensor * conv2_kernel = nullptr;
+    struct ggml_tensor * conv2_bias   = nullptr;
+    struct ggml_tensor * dense_weight = nullptr;
+    struct ggml_tensor * dense_bias   = nullptr;
+
+    // 重要的上下文管理
+    struct ggml_context * ctx_gguf    = nullptr;        // 权重上下文管理
+    struct ggml_context * ctx_static  = nullptr;        // 存储静态权重tensor的元数据
+    struct ggml_context * ctx_compute = nullptr;        // 存计算图中间节点
+    ggml_backend_buffer_t buf_gguf    = nullptr;        // ctx_gguf对应的后端存储
+    ggml_backend_buffer_t buf_static  = nullptr;        // ctx_static的后端存储
+```
+
+### gguf_context
+
+```c
+struct gguf_context {
+    uint32_t version = GGUF_VERSION;
+
+    std::vector<struct gguf_kv> kv;
+    std::vector<struct gguf_tensor_info> info;
+
+    size_t alignment = GGUF_DEFAULT_ALIGNMENT;
+    size_t offset    = 0; // offset of `data` from beginning of file
+    size_t size      = 0; // size of `data` in bytes
+
+    void * data = nullptr;
+};
+```
+
+<--gguf数据结构待补充-->
+
+n_kv n_tensors 学习一下gguf的具体格式
 
 
-### ggml_tensor
+## 数据集构建
 
+### ggml_init
 
-
-## mnist-eval.cpp
-
+首先就是走`ggml_opt_dataset_init`这个函数，进行初始化，这里上来是一个参数的初始化，也就是ggml_init_params params = {}; 这里为什么是`ggml_tensor_overhead()`，看到这个里面就是返回两个结构体的元数据大小，也就是`ggml_object`的size，是32，`ggml_tensor`的size，是336。乘以二刚好就是输入数据和数据标签两个ggml_object的大小，把这个参数送到ggml_init进行初始化。
 ```cpp
     ggml_opt_dataset_t result = new ggml_opt_dataset;
     result->ndata       = ndata;
@@ -219,13 +278,20 @@ struct ggml_opt_dataset {
 
 ```
 
-是去申请ggml_context，这个context你可以理解为一个ggml_obj的一个内存池，以链表的形式去存一个个的ggml_obj的对象
+往下来底层走的是一个`ggml_malloc`，sizeof(ctx)是40。
 
-object有三种：tensor、graph和buffer
+`GGML_PAD(params.mem_size, GGML_MEM_ALIGN)`会进行一个内存对齐的内存申请，这块就是申请两个`ggml_object` + `ggml_tensor`的结构体，因为我们是no_alloc的，所以不会在ctx中保存数据信息
 
-前面是把ggml_init给init好了
+这样context这个数据结构就定义好了，下一步是生成具体的tensor结构体。
 
-ggml_new_tensor_2d，是去申请context里面的data，这个data就是提前开辟好的内存
+### ggml_new_tensor_impl
 
-get_tensor的过程中`ggml_new_tensor_impl`，是返回ggml_tensor，主要做的工作是new一个ggml的object，可以看一下这个object，`static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml_object_type type, size_t size)`
+这个很好理解，就是去把具体的ctx中的obj和tensor定义好，但是这一步仅仅是声明了元数据，包括tensor的ne、nb，维护好了ctx这个链表，但是具体的数据buf还没有维护好
 
+### ggml_backend_alloc_ctx_tensors_from_buft
+
+这个是分配到具体后端上的内存
+
+## 模型构建
+
+在模型构建过程中我们维护第二个`gguf_context`
