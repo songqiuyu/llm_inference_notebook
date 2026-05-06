@@ -252,10 +252,177 @@ struct gguf_context {
 };
 ```
 
-<--gguf数据结构待补充-->
+![alt text](image-2.png)
 
 n_kv n_tensors 学习一下gguf的具体格式
 
+### ggml_backend_reg
+
+```cpp
+struct ggml_backend_reg {
+    int api_version; // initialize to GGML_BACKEND_API_VERSION
+    struct ggml_backend_reg_i iface;
+    void * context;
+};
+```
+
+这应该是一个标明后端的结构，主要是声明后端的一些情况，有一些虚函数可以使用
+
+### ggml_backend_device
+
+```cpp
+struct ggml_backend_device {
+    struct ggml_backend_device_i iface;
+    ggml_backend_reg_t reg;
+    void * context;
+};
+```
+
+device也是同理的，我们有很多device的接口，它对应的reg的地址，也就是跟ggml_backend_reg对应起来的，再一个就是context
+
+```cpp
+struct ggml_backend_device_i {
+        // device name: short identifier for this device, such as "CPU" or "CUDA0"
+        const char * (*get_name)(ggml_backend_dev_t dev);
+
+        // device description: short informative description of the device, could be the model name
+        const char * (*get_description)(ggml_backend_dev_t dev);
+
+        // device memory in bytes: 0 bytes to indicate no memory to report
+        void         (*get_memory)(ggml_backend_dev_t dev, size_t * free, size_t * total);
+
+        // device type
+        enum ggml_backend_dev_type (*get_type)(ggml_backend_dev_t dev);
+
+        // device properties
+        void (*get_props)(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props);
+
+        // backend (stream) initialization
+        ggml_backend_t (*init_backend)(ggml_backend_dev_t dev, const char * params);
+
+        // preferred buffer type
+        ggml_backend_buffer_type_t (*get_buffer_type)(ggml_backend_dev_t dev);
+
+        // (optional) host buffer type (in system memory, typically this is a pinned memory buffer for faster transfers between host and device)
+        ggml_backend_buffer_type_t (*get_host_buffer_type)(ggml_backend_dev_t dev);
+
+        // (optional) buffer from pointer: create a buffer from a host pointer (useful for memory mapped models and importing data from other libraries)
+        ggml_backend_buffer_t (*buffer_from_host_ptr)(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size);
+
+        // check if the backend can compute an operation
+        bool (*supports_op)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+
+        // check if the backend can use tensors allocated in a buffer type
+        bool (*supports_buft)(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft);
+
+        // (optional) check if the backend wants to run an operation, even if the weights are allocated in an incompatible buffer
+        // these should be expensive operations that may benefit from running on this backend instead of the CPU backend
+        bool (*offload_op)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+
+        // (optional) event synchronization
+        ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
+        void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+    };
+```
+
+这张虚函数表还是很关键的，我们一层层来看
+
+如果是以cpu为例，`ggml_backend_cpu_device_init_backend`返回的是cpu的init，这就是具体的函数了，用虚函数表来实现运行时的多态
+
+
+### ggml_backend_cpu_context
+
+```cpp
+struct ggml_backend_cpu_context {
+    int                 n_threads;
+    ggml_threadpool_t   threadpool;
+
+    uint8_t *           work_data;
+    size_t              work_size;
+
+    ggml_abort_callback abort_callback;
+    void *              abort_callback_data;
+
+    bool                use_ref;  // use reference implementation
+};
+```
+
+这是cpu后端的上下文类，我们这里主要声明线程数量、线程池、数据、数据量
+
+GGML_DEFAULT_N_THREADS的默认线程数量是4
+
+### ggml_backend
+
+```cpp
+struct ggml_backend {
+    ggml_guid_t guid;
+    struct ggml_backend_i iface;
+    ggml_backend_dev_t device;
+    void * context;
+};
+```
+
+### ggml_backend_sched
+
+```cpp
+struct ggml_backend_sched {
+    bool is_reset; // true if the scheduler has been reset since the last graph split
+    bool is_alloc;
+
+    int n_backends;
+
+    ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
+    ggml_gallocr_t galloc;
+
+    // hash map of the nodes in the graph
+    struct ggml_hash_set  hash_set;
+    int                 * hv_tensor_backend_ids; // [hash_set.size]
+    struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+
+    int * node_backend_ids; // [graph_size]
+    int * leaf_backend_ids; // [graph_size]
+
+    int * prev_node_backend_ids; // [graph_size]
+    int * prev_leaf_backend_ids; // [graph_size]
+
+    // copy of the graph with modified inputs
+    struct ggml_cgraph graph;
+
+    // graph splits
+    struct ggml_backend_sched_split * splits;
+    int n_splits;
+    int splits_capacity;
+
+    // pipeline parallelism support
+    int n_copies;
+    int cur_copy;
+    int next_copy;
+    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
+    int n_graph_inputs;
+
+    struct ggml_context * ctx;
+
+    ggml_backend_sched_eval_callback callback_eval;
+    void * callback_eval_user_data;
+
+    char * context_buffer;
+    size_t context_buffer_size;
+
+    bool op_offload;
+
+    int debug;
+
+    // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
+    // ref: https://github.com/ggml-org/llama.cpp/pull/17617
+    int debug_realloc;
+    int debug_graph_size;
+    int debug_prev_graph_size;
+};
+
+```
 
 ## 数据集构建
 
@@ -295,3 +462,29 @@ n_kv n_tensors 学习一下gguf的具体格式
 ## 模型构建
 
 在模型构建过程中我们维护第二个`gguf_context`
+
+## 计算图构建
+
+### 矩阵乘法算子构建
+
+```c
+struct ggml_tensor * ggml_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(ggml_can_mul_mat(a, b));
+    GGML_ASSERT(!ggml_is_transposed(a));
+
+    const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+```
+
+## 模型推理
+
