@@ -112,6 +112,44 @@ struct ggml_tensor {
 `op_params`：运算参数
 
 
+### ggml_cgraph
+
+```c
+struct ggml_cgraph {
+    int size;    // maximum number of nodes/leafs/grads/grad_accs
+    int n_nodes; // number of nodes currently in use
+    int n_leafs; // number of leafs currently in use
+
+    struct ggml_tensor ** nodes;     // tensors with data that can change if the graph is evaluated
+    struct ggml_tensor ** grads;     // the outputs of these tensors are the gradients of the nodes
+    struct ggml_tensor ** grad_accs; // accumulators for node gradients
+    struct ggml_tensor ** leafs;     // tensors with constant data
+    int32_t             * use_counts;// number of uses of each tensor, indexed by hash table slot
+
+    struct ggml_hash_set visited_hash_set;
+
+    enum ggml_cgraph_eval_order order;
+
+    // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
+    // a value of 0 means it is not set and should be ignored
+    uint64_t uid;
+};
+
+```
+
+`n_nodes`：节点数
+`n_leafs`：叶子数
+`nodes`：需要计算的张量（中间结果）
+`grads`：对应梯度（用于反向传播）
+`grad_accs`：梯度累计器
+`leafs`：常量/输入/权重
+`use_counts`：每个节点的引用计数
+
+`visited_hash_set`：去重哈希表
+`order`：求值顺序
+`uid`：可选唯一标识
+
+
 
 
 ### ggml_backend_buffer
@@ -684,6 +722,30 @@ struct gpt2_kv_cell {
 ```
 
 KVCache底层实现是一个环形缓冲区，数组长度是n_ctx，每个cell对应KVcache中的一个位置序列。
+
+### gpt2_batch
+
+```cpp
+struct gpt2_batch {
+    int32_t n_tokens = -1;
+
+    gpt_vocab::id  * token  = {};
+    float          * embd   = {};
+    gpt2_pos       * pos    = {};
+    gpt2_seq_id    * seq_id = {};
+    int8_t         * logits = {};
+};
+
+```
+
+batch 中共有 n_tokens 个 token：
+               [0]       [1]       [2]       [3]
+ token[i]  =   464        3937      318       257      ← 输入 token ID
+ embd[i]   =   NULL      NULL      NULL      NULL      ← 外部 embedding（token和embd二选一）
+ pos[i]    =   0          1         2         3        ← 序列位置
+ seq_id[i] =   0          0         1         1        ← 属于哪个序列
+ logits[i] =   0(false)   0(false)  0(false)  1(true)  ← 是否需要该位置的输出
+
 
 
 
