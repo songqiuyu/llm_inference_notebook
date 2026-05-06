@@ -172,6 +172,19 @@ struct ggml_backend_buffer_i {
 
 ![alt text](image-1.png)
 
+### ggml_tallocr
+
+```cpp
+struct ggml_tallocr {
+    ggml_backend_buffer_t buffer;
+    void * base;
+    size_t alignment;
+    size_t offset;
+};
+```
+
+tensor不是没有具体指向后端的buffer，通过ggml_tallocr来将tensor的data变量指向buffer
+
 ### ggml_opt_dataset
 
 ggml_opt_dataset是最新版里面，用来初始化数据集的。
@@ -486,5 +499,258 @@ struct ggml_tensor * ggml_mul_mat(
 }
 ```
 
+![alt text](image-3.png)
+
 ## 模型推理
+
+
+# GPT-batched
+
+## 数据结构
+
+### gpt_params
+
+```cpp
+struct gpt_params {
+    int32_t seed         = -1;   // RNG seed    随机种子，那就是随机种子
+    int32_t n_threads    = std::min(4, (int32_t) std::thread::hardware_concurrency());      // 线程数，CPU并行计算的值，如果后端加速采用cpu，那这个变量有效
+    int32_t n_predict    = 200;  // new tokens to predict   这个是自回归生成的token数量
+    int32_t n_parallel   = 1;    // number of parallel streams  并行序列的数量，共享prompt的KVCache
+    int32_t n_batch      = 32;   // batch size for prompt processing 批大小
+    int32_t n_ctx        = 2048; // context size (this is the KV cache max size) 上下文窗口大小，KV Cache能够容纳的最大的token数量（上下文窗口上限）
+    int32_t n_gpu_layers = 0;    // number of layers to offlload to the GPU 针对GPU，卸载到GPU的层数
+
+    bool ignore_eos = false; // ignore EOS token when generating text 
+
+    // sampling parameters
+    int32_t top_k          = 40;
+    float   top_p          = 0.9f;
+    float   temp           = 0.9f;
+    int32_t repeat_last_n  = 64;
+    float   repeat_penalty = 1.00f;
+
+    std::string model      = "models/gpt-2-117M/ggml-model.bin"; // model path
+    std::string prompt     = "";
+    std::string token_test = "";
+
+    bool    interactive      = false;
+    int32_t interactive_port = -1;
+};
+```
+
+这些是跟大模型推理相关的一些重要参数：
+
+`ignore_eos`：是否忽略EOS这个token（end of sentence），true的话，预测到了EOS生成也不会停止
+`top_k`：每步从概率最高的K个抽样
+`top_p`：Nucleus采样，从概率最高的token开始累积，只保留概率达到p的token
+`temp`：temperature（温度），在softmax前将logits除以temp `logits / temp`，temp越小，分布越尖锐（更确定），temp越大，分布越平坦（更多样）
+`repeat_last_n`：重复惩罚的窗口大小，查看最近N个已生成的token，对他们的概率施加惩罚（避免重复生成相同的值）
+`repeat_penalty`：重复惩罚系数，默认1.0表示不惩罚
+
+`interactive`：交互模式开关
+`interactive_port`：交互模式端口
+
+### gpt_vocab
+
+```cpp
+struct gpt_vocab {
+    using id    = int32_t;
+    using token = std::string;
+
+    std::map<token, id> token_to_id;
+    std::map<id, token> id_to_token;
+    std::vector<std::string> special_tokens;
+
+    void add_special_token(const std::string & token);
+};
+```
+
+这个比较简单，就是维护了一个id与实际token的映射表，id->token和token->id
+
+
+### gpt2_model
+
+```cpp
+struct gpt2_model {
+    gpt2_hparams hparams;
+
+    // normalization
+    struct ggml_tensor * ln_f_g;
+    struct ggml_tensor * ln_f_b;
+
+    struct ggml_tensor * wte;     //    token embedding
+    struct ggml_tensor * wpe;     // position embedding
+    struct ggml_tensor * lm_head; // language model head
+
+    std::vector<gpt2_layer> layers;
+
+    gpt2_kv_cache kv_cache;
+
+    struct ggml_context * ctx_w;
+
+    ggml_backend_t backend = NULL;
+
+    ggml_backend_buffer_t buffer_w;
+
+    std::map<std::string, struct ggml_tensor *> tensors;
+};
+```
+
+在搞清楚gpt2_model这个结构体之前，先看gpt2_hparams，这个是模型的超参数
+
+```cpp
+gpt2_model_load: n_vocab = 50257    // token词表大小 用的是BPE的分词方法
+gpt2_model_load: n_ctx   = 1024     // 上下文长度
+gpt2_model_load: n_embd  = 768      // 每个token用768个维度来表示
+gpt2_model_load: n_head  = 12       // 头的个数 MHA
+gpt2_model_load: n_layer = 12       // 层的个数
+gpt2_model_load: ftype   = 1        // 权重的数据类型，ftype=1表示的是FP16
+gpt2_model_load: qntvr   = 0        // 量化版本号 = 0 表示就是FP16
+```
+
+`ln_f_g `和 `ln_f_b`是顶层权重，最终LayerNorm，形状是[768]，在所有的Transformer层之后、Lm_head之前来应用。这两个都是Layer Normalization层归一化的可学习参数。这个就是层归一化的weight和bias。在代码中要对768个位置进行归一化运算。
+
+
+`wte`指的是word token embedding，是一个50257 -> 768的一个映射，输入一个token的id，返回768的向量值
+`wpe`指的是word position embedding，位置编码信息，是一个1024个位置到768的映射，也就是上下文长度1024个，每个位置学习一个位置编码信息值
+`lm_head`指的是Language Model Head，50257 -> 768的映射。最后一层矩阵乘法将768维度的token映射回50257个概率
+GPT2中`wte`和`lm_head`是共享权重的
+
+```cpp
+struct gpt2_layer {
+    // normalization
+    struct ggml_tensor * ln_1_g;
+    struct ggml_tensor * ln_1_b;
+
+    struct ggml_tensor * ln_2_g;
+    struct ggml_tensor * ln_2_b;
+
+    // attention
+    struct ggml_tensor * c_attn_attn_w;
+    struct ggml_tensor * c_attn_attn_b;
+
+    struct ggml_tensor * c_attn_proj_w;
+    struct ggml_tensor * c_attn_proj_b;
+
+    // mlp
+    struct ggml_tensor * c_mlp_fc_w;
+    struct ggml_tensor * c_mlp_fc_b;
+
+    struct ggml_tensor * c_mlp_proj_w;
+    struct ggml_tensor * c_mlp_proj_b;
+};
+```
+
+gpt2_layer就是每一层都固有的一些变量
+
+`ln_1_g/b`就是Attention前的LayerNorm
+`ln_2_g/b`就是FFN前的LayerNorm
+`c_attn_attn_w/b`就是QKV的矩阵投影
+`c_attn_proj_w/b`就是输出投影
+`c_mlp_fc_w/b`就是FFN的第一层
+`c_mlp_proj_w/b`就是FFN投影回去的层
+
+然后是kv_cache，就是kv缓存，存储所有层所有位置的key和value矩阵，避免重复计算，具体结构：
+
+```cpp
+struct gpt2_kv_cache {
+    // key + value memory
+    struct ggml_tensor * k;
+    struct ggml_tensor * v;
+    //
+
+    uint32_t head = 0;
+    uint32_t size = 0;
+
+    // computed before each graph build
+    uint32_t n = 0;
+
+    std::vector<gpt2_kv_cell> cells;    //[n_ctx] 个 gpt2_kv_cell   // **管理每个槽位的元数据**
+
+    ggml_backend_buffer_t buffer;
+};
+
+
+struct gpt2_kv_cell {
+    gpt2_pos pos   = -1;
+    gpt2_pos delta = 0;
+
+    std::set<gpt2_seq_id> seq_id;
+
+    bool has_seq_id(const gpt2_seq_id & id) const {
+        return seq_id.find(id) != seq_id.end();
+    }
+};
+```
+
+KVCache底层实现是一个环形缓冲区，数组长度是n_ctx，每个cell对应KVcache中的一个位置序列。
+
+
+
+## 关键流程
+
+计算总缓冲区大小：
+
+ln_f_g + ln_f_b              =   768*4 +   768*4  =      6 KB
+
+wte        [50257, 768] F16  = 50257*768*2         = ~77 MB
+wpe        [1024,  768] F32  =  1024*768*4         =  ~3 MB
+lm_head    [50257, 768] F16  = 50257*768*2         = ~77 MB   (实际与 wte 共享)
+
+每层 (12 层)：
+  ln_1_g/b    [768] F32      =   768*4 * 2         =   6 KB
+  ln_2_g/b    [768] F32      =   768*4 * 2         =   6 KB
+  c_attn_attn_w [768, 2304] F16  = 768*2304*2     = ~3.5 MB
+  c_attn_attn_b [2304]      F32  = 2304*4          =   9 KB
+  c_attn_proj_w [768, 768]  F16  = 768*768*2      = ~1.2 MB
+  c_attn_proj_b [768]       F32  = 768*4           =   3 KB
+  c_mlp_fc_w    [768, 3072] F16  = 768*3072*2     = ~4.7 MB
+  c_mlp_fc_b    [3072]      F32  = 3072*4          =  12 KB
+  c_mlp_proj_w  [3072, 768] F16  = 3072*768*2     = ~4.7 MB
+  c_mlp_proj_b  [768]       F32  = 768*4           =   3 KB
+
+总额 ≈ 240 MB (FP16 权重) + 少量 F32 参数 + 对齐开销
+```shell
+gpt2_model_load: ggml tensor size    = 336 bytes
+gpt2_model_load: backend buffer size = 312.82 MB
+```
+
+打开文件
+  │
+  ├─ 验证魔数 "ggml"
+  ├─ 读 6 个超参数 (n_vocab, n_ctx, n_embd, n_head, n_layer, ftype)
+  ├─ 读 50257 个 token 字符串 → vocab
+  ├─ 计算 152 个 tensor 的总字节数 → buffer_size
+  ├─ 创建 ggml_context (no_alloc=true, 只存元数据)
+  ├─ 初始化 backend (CUDA > Metal > CPU)
+  ├─ 分配 buffer_w ← 权重数据全放这里
+  ├─ 创建 152 个 tensor 对象 + 名称映射表
+  ├─ 创建 KV cache (k+v 各 36MB, 分配 backend buffer)
+  └─ 逐块读取文件 → 按名匹配 tensor → 写入对应数据块
+
+
+
+### ggml_backend_cpu_init
+
+
+ggml_backend_cpu_init()
+  ├── ggml_cpu_init()           // 一次性的 CPU 特性检测
+  ├── new ggml_backend_cpu_context   // 私有运行时状态（线程数、work buffer 等）
+  │       .n_threads  = 4
+  │       .threadpool = NULL
+  │       .work_data  = NULL   // 首次计算时惰性分配
+  │       .use_ref    = false  // 默认走 SIMD 优化路径
+  └── new ggml_backend
+        ├── .guid    = CPU 专属 GUID
+        ├── .iface   = {
+        │       .get_name       = "CPU"
+        │       .graph_compute  = ggml_backend_cpu_graph_compute
+        │       其他异步/事件函数 = NULL（CPU 不同步方式不同）
+        │   }
+        ├── .device  = {
+        │       .iface   = { .get_name = "CPU", .get_description = "Intel Core i7-..." }
+        │       .reg     = ggml_backend_cpu_reg (version=2, 1个设备)
+        │       .context = { description = "Intel(R) Core(TM) i7-13700K" }
+        │   }
+        └── .context = 指向 ggml_backend_cpu_context
 
