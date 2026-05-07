@@ -223,6 +223,38 @@ struct ggml_tallocr {
 
 tensor不是没有具体指向后端的buffer，通过ggml_tallocr来将tensor的data变量指向buffer
 
+
+### ggml_gallocr
+
+``` c
+struct ggml_gallocr {
+    ggml_backend_buffer_type_t * bufts; // [n_buffers]
+    struct vbuffer ** buffers; // [n_buffers]
+    struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
+    int n_buffers;
+
+    struct ggml_hash_set hash_set;
+    struct hash_node * hash_values; // [hash_set.size]
+
+    struct node_alloc * node_allocs; // [n_nodes]
+    int n_nodes;
+
+    struct leaf_alloc * leaf_allocs; // [n_leafs]
+    int n_leafs;
+};
+```
+
+`bufts`：指向一个数组，这个数组存储了不同的缓冲区类型。每一个缓冲区类型对应一种后端（CPU/GPU）
+`buffers`：实际的缓冲区指针，N_buffers个缓冲区指针
+`n_buffers`：就是一共多少个缓冲区
+`buf_tallocs`：也是n个，这个存储的是动态张量分配器的指针，分配器去负责管理对应缓冲区中的张量分配
+`hash_set`：用于存储和快速查找张量的哈希表，哈希表用来记录张量的使用情况，避免重复分配和管理张量
+`hash_values`：指向一个数组，数组存储哈希表中的节点
+`node_allocs`：指向一个数组，数组存储了计算图中每个节点的分配信息，每个节点表示一个操作或张量
+`n_nodes`：节点的个数
+`leaf_alloc`：指向一个数组，数组存储了计算图每个叶子节点的分配信息，每个节点表示一个操作或张量
+`n_leafs`：叶子节点个数
+
 ### ggml_opt_dataset
 
 ggml_opt_dataset是最新版里面，用来初始化数据集的。
@@ -815,4 +847,115 @@ ggml_backend_cpu_init()
         │       .context = { description = "Intel(R) Core(TM) i7-13700K" }
         │   }
         └── .context = 指向 ggml_backend_cpu_context
+
+### gpt2_graph
+
+构建计算图的部分
+
+1. 初始化
+
+没什么好说的，就是去把数值给附上即可
+
+2. 分配缓冲区（内存分配）
+
+这里的一个主要的代码是
+```cpp
+static size_t buf_size = ggml_tensor_overhead()*GPT2_MAX_NODES + ggml_graph_overhead_custom(GPT2_MAX_NODES, false);
+static std::vector<uint8_t> buf(buf_size);
+```
+
+因为用的都是`no_alloc`的模式，所以只需要去分配meta_data的数据量即可，可以看到tensor的大小（obj + tensor）去乘以GPT2_MAX_NODES，节点2048个，叶子2048个，加上应该是去计算图的大小，也是(obj + graph)的尺寸。
+
+
+```cpp
+static size_t ggml_graph_nbytes(size_t size, bool grads) {
+    size_t hash_size = ggml_hash_size(size * 2);
+    void * p = 0;
+    incr_ptr_aligned(&p, sizeof(struct ggml_cgraph), 1);
+    incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes
+    incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // leafs
+    incr_ptr_aligned(&p, hash_size * sizeof(int32_t), sizeof(int32_t)); // use_counts
+    incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // hash keys
+    if (grads) {
+        incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grads
+        incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // grad_accs
+    }
+    incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
+
+    size_t nbytes = (size_t) p;
+    return nbytes;
+}
+```
+
+这里主要有一个计算图大小的计算函数，比较有意思的是有一个ggml_hash_size的申请，返回一个最小的哈希表大小，然后初始化指针，去分配ggml_cgraph的空间，然后分配nodes的空间，但注意这里sizeof并不是结构体，而是结构体指针，我只需要知道指向哪里就好，然后是叶子节点，然后是引用计数和hash Key，这两个是针对哈希表的。如果我们使用了grads，那还有指向grads的tensor。`ggml_bitset`就是一个指示的数据，为1表示这里有东西存放了。
+
+对于cgraph来讲就是一个Obj的头，加上后面跟着cgraph的数据结构，里面是各种tensor指针
+
+然后比较核心的地方来了，就是`ggml_new_graph_cust()`，计算完大小，我们正式创建计算图
+
+`struct ggml_cgraph  * gf = ggml_new_graph_custom(ctx, GPT2_MAX_NODES, false);`
+
+这里我们有一个上下文管理ctx，然后node个数传进去，不带有梯度，开始构建计算图
+
+```c
+struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t size, bool grads) {
+    const size_t obj_size = ggml_graph_nbytes(size, grads);
+    struct ggml_object * obj = ggml_new_object(ctx, GGML_OBJECT_TYPE_GRAPH, obj_size);
+    struct ggml_cgraph * cgraph = (struct ggml_cgraph *) ((char *) ctx->mem_buffer + obj->offs);
+
+    // the size of the hash table is doubled since it needs to hold both nodes and leafs
+    size_t hash_size = ggml_hash_size(size * 2);
+
+    void * p = cgraph + 1;
+
+    struct ggml_tensor ** nodes_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *));
+    struct ggml_tensor ** leafs_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *));
+    int32_t             * use_counts_ptr =         incr_ptr_aligned(&p, hash_size * sizeof(int32_t), sizeof(int32_t));
+    struct ggml_tensor ** hash_keys_ptr  =         incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *));
+    struct ggml_tensor ** grads_ptr      = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
+    struct ggml_tensor ** grad_accs_ptr  = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)) : NULL;
+
+    ggml_bitset_t * hash_used = incr_ptr_aligned(&p, ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
+
+    // check that we allocated the correct amount of memory
+    assert(obj_size == (size_t)((char *)p - (char *)cgraph));
+
+    *cgraph = (struct ggml_cgraph) {
+        /*.size         =*/ size,
+        /*.n_nodes      =*/ 0,
+        /*.n_leafs      =*/ 0,
+        /*.nodes        =*/ nodes_ptr,
+        /*.grads        =*/ grads_ptr,
+        /*.grad_accs    =*/ grad_accs_ptr,
+        /*.leafs        =*/ leafs_ptr,
+        /*.use_counts   =*/ use_counts_ptr,
+        /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
+        /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
+        /*.uid          =*/ 0,
+    };
+
+    ggml_hash_set_reset(&cgraph->visited_hash_set);
+    if (grads) {
+        memset(cgraph->grads,     0, hash_size*sizeof(struct ggml_tensor *));
+        memset(cgraph->grad_accs, 0, hash_size*sizeof(struct ggml_tensor *));
+    }
+
+    return cgraph;
+}
+
+```
+
+之前只是去算，这里就是正儿八经的分配空间，分配指针
+
+
+#### 为什么要用哈希？
+
+主要还是为了能够通过计算图去快速定位到目标Tensor，因为在计算图结构体中，没有这个哈希的话，还是顺序存放，要一个个去找，非常麻烦
+
+### 算子构建
+
+我们首先针对gpt2_small来画一个流程图，是怎么进行计算的
+
+`ggml_get_rows`是从张量中提取特定行的数据，提取出由inp_tokens指定的行，返回一个新的张量
+
 
